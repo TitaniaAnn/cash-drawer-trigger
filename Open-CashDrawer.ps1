@@ -34,6 +34,15 @@ $BaudRate = 9600
 # Reuse $KickBytes above or set port-specific bytes here:
 [byte[]]$ComKickBytes = $KickBytes
 
+# --- Browser / HTTP trigger ---
+# When enabled, the app also listens on http://localhost:<port>/open so a web
+# page's JavaScript can kick the drawer:
+#   fetch('http://localhost:8737/open', { method: 'POST' })
+# Loopback only - nothing outside this machine can reach it.
+$EnableHttpTrigger = $true
+$HttpPort          = 8737
+$AllowedOrigin     = '*'   # tighten to your POS site, e.g. 'https://pos.example.com'
+
 # --- Button appearance ---
 $ButtonText = "OPEN`nDRAWER"
 $WindowSize = 110            # px, square
@@ -154,8 +163,10 @@ $flashTimer.Add_Tick({
     $button.Text = $ButtonText
 })
 
-$button.Add_Click({
-    if ($drag.Moved) { $drag.Moved = $false; return }
+# Kicks the drawer and flashes the button. Returns $null on success,
+# the error message on failure. Shared by the button and the HTTP trigger.
+function Invoke-DrawerKick {
+    $result = $null
     try {
         Open-Drawer
         $button.BackColor = [System.Drawing.Color]::FromArgb(0, 180, 100)   # green flash
@@ -163,10 +174,19 @@ $button.Add_Click({
     catch {
         $button.BackColor = [System.Drawing.Color]::FromArgb(180, 40, 40)   # red flash
         $button.Text = 'ERROR'
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Cash Drawer',
-            'OK', 'Error') | Out-Null
+        $result = $_.Exception.Message
     }
+    $flashTimer.Stop()
     $flashTimer.Start()
+    return $result
+}
+
+$button.Add_Click({
+    if ($drag.Moved) { $drag.Moved = $false; return }
+    $err = Invoke-DrawerKick
+    if ($err) {
+        [System.Windows.Forms.MessageBox]::Show($err, 'Cash Drawer', 'OK', 'Error') | Out-Null
+    }
 })
 
 # Borderless window, so make it draggable from anywhere on the button.
@@ -195,5 +215,92 @@ $button.Add_MouseUp({ $drag.Active = $false })
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $menu.Items.Add('Exit').Add_Click({ $form.Close() }) | Out-Null
 $button.ContextMenuStrip = $menu
+
+# ============================ HTTP TRIGGER ===================================
+# A minimal HTTP server on 127.0.0.1 so browser JavaScript can fire the drawer.
+# Raw TcpListener instead of HttpListener because loopback TcpListener needs no
+# admin rights or netsh urlacl reservation. A WinForms timer polls Pending() on
+# the UI thread, so the kick and button flash run on the right thread for free.
+
+function Send-HttpResponse {
+    param($Writer, [string]$Status, [string]$Body)
+    $len = [System.Text.Encoding]::UTF8.GetByteCount($Body)
+    $Writer.Write("HTTP/1.1 $Status`r`n")
+    $Writer.Write("Access-Control-Allow-Origin: $AllowedOrigin`r`n")
+    $Writer.Write("Access-Control-Allow-Methods: GET, POST, OPTIONS`r`n")
+    $Writer.Write("Access-Control-Allow-Headers: *`r`n")
+    # Chromium's Private Network Access preflight needs this to allow a public
+    # https site to call localhost.
+    $Writer.Write("Access-Control-Allow-Private-Network: true`r`n")
+    $Writer.Write("Content-Type: application/json`r`n")
+    $Writer.Write("Content-Length: $len`r`n")
+    $Writer.Write("Connection: close`r`n`r`n")
+    if ($len -gt 0) { $Writer.Write($Body) }
+    $Writer.Flush()
+}
+
+if ($EnableHttpTrigger) {
+    $httpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $HttpPort)
+    try {
+        $httpListener.Start()
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "HTTP trigger disabled - couldn't listen on port ${HttpPort}: $($_.Exception.Message)",
+            'Cash Drawer', 'OK', 'Warning') | Out-Null
+        $httpListener = $null
+    }
+
+    if ($httpListener) {
+        $httpTimer = New-Object System.Windows.Forms.Timer
+        $httpTimer.Interval = 100
+        $httpTimer.Add_Tick({
+            while ($httpListener.Pending()) {
+                $client = $null
+                try {
+                    $client = $httpListener.AcceptTcpClient()
+                    $client.ReceiveTimeout = 1000
+                    $stream = $client.GetStream()
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $writer = New-Object System.IO.StreamWriter($stream)
+
+                    $requestLine = $reader.ReadLine()
+                    while (-not [string]::IsNullOrEmpty($reader.ReadLine())) { }   # drain headers
+
+                    $parts  = "$requestLine" -split ' '
+                    $method = $parts[0]
+                    $path   = if ($parts.Count -gt 1) { $parts[1].Split('?')[0] } else { '' }
+
+                    if ($method -eq 'OPTIONS') {
+                        Send-HttpResponse $writer '204 No Content' ''
+                    }
+                    elseif ($path -eq '/open') {
+                        $err = Invoke-DrawerKick
+                        if ($null -eq $err) {
+                            Send-HttpResponse $writer '200 OK' '{"ok":true}'
+                        }
+                        else {
+                            $safe = $err -replace '[\\"]', "'" -replace '[\r\n\t]', ' '
+                            Send-HttpResponse $writer '500 Internal Server Error' "{`"ok`":false,`"error`":`"$safe`"}"
+                        }
+                    }
+                    else {
+                        Send-HttpResponse $writer '404 Not Found' '{"ok":false,"error":"unknown path, use /open"}'
+                    }
+                }
+                catch { }   # a hung or malformed client shouldn't kill the app
+                finally {
+                    if ($client) { $client.Close() }
+                }
+            }
+        })
+        $httpTimer.Start()
+
+        $form.Add_FormClosed({
+            $httpTimer.Stop()
+            $httpListener.Stop()
+        })
+    }
+}
 
 [System.Windows.Forms.Application]::Run($form)

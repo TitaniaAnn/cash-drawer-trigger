@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cash Drawer Trigger - Test Page</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 3rem auto; }
+    button { font-size: 1.2rem; padding: 0.8rem 1.6rem; cursor: pointer; }
+    #status { margin-top: 1rem; font-weight: bold; }
+    .ok { color: #0a8a50; }
+    .fail { color: #c02828; }
+  </style>
+</head>
+<body>
+  <h1>Cash drawer test</h1>
+  <p>Start <code>OpenCashDrawer.bat</code> first, then click:</p>
+
+  <!-- No data-open-drawer attribute here: this page calls openCashDrawer()
+       itself so it can show the result, and the attribute would fire it twice. -->
+  <button id="test-open">Open drawer</button>
+  <p id="status"></p>
+
+  <script src="website-trigger.js"></script>
+  <script>
+    const status = document.getElementById('status');
+    document.getElementById('test-open').addEventListener('click', async () => {
+      status.textContent = '...';
+      const ok = await openCashDrawer();
+      status.textContent = ok ? 'Drawer opened' : 'Failed - check the console (F12) and that the app is running';
+      status.className = ok ? 'ok' : 'fail';
+    });
+  </script>
+</body>
+</html>

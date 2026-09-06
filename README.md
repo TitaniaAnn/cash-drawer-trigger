@@ -2,7 +2,8 @@
 
 An always-on-top button for Windows 11 that pops open a USB cash drawer. One
 PowerShell script, no installs — uses the WinForms and Win32 APIs already on
-every Windows machine.
+every Windows machine. It can also be triggered from JavaScript on a web page
+(see [Triggering from a website](#triggering-from-a-website)).
 
 ## Quick start
 
@@ -70,10 +71,76 @@ vendor-specific software or an OPOS driver — this script can't reach it
 directly. Most vendors (APG, MMF) offer a virtual-COM mode or driver that
 makes it appear as a COM port; enable that and use COM mode.
 
-## Running it at logon
+## Triggering from a website
 
-Put a shortcut to `OpenCashDrawer.bat` in the Startup folder: press
-`Win+R`, run `shell:startup`, and drop the shortcut there.
+The app also runs a tiny HTTP server on `http://localhost:8737` (loopback
+only — nothing off the machine can reach it), so JavaScript on any web page
+open in a browser **on the same till PC** can pop the drawer:
+
+```js
+fetch('http://localhost:8737/open', { method: 'POST' });
+```
+
+`examples/website-trigger.js` is a drop-in version with error handling and
+two wiring styles: attach to specific buttons by selector, or add a
+`data-open-drawer` attribute to any element (a delegated listener catches
+those, including ones added to the page later):
+
+```html
+<button data-open-drawer>Cash Payment</button>
+<script src="website-trigger.js"></script>
+```
+
+To try it without a website, start the app and open
+`examples/test-page.html` in a browser.
+
+Config lives in the same CONFIG block as everything else:
+
+```powershell
+$EnableHttpTrigger = $true    # $false turns the server off entirely
+$HttpPort          = 8737     # change if something else uses this port
+$AllowedOrigin     = '*'      # CORS: lock to your site, e.g. 'https://pos.example.com'
+```
+
+Notes:
+
+- The page can be served from anywhere (an https site included) — browsers
+  treat `localhost` as trustworthy, so Chrome, Edge and Firefox allow the
+  call from https pages. The app answers Chromium's Private Network Access
+  preflight, which those requests go through.
+- Setting `$AllowedOrigin` to your site's origin stops other websites open
+  in the browser from reading the response. Worst case with `*` is that a
+  malicious page could pop the drawer open, so tighten it if the till
+  browses the open web.
+- Success returns `{"ok":true}`; failures return `{"ok":false,"error":"..."}`
+  with HTTP 500 and flash the on-screen button red, same as a failed click.
+
+## Running it at startup
+
+Easiest: the Startup folder. Runs whenever you log in.
+
+1. Press `Win+R`, type `shell:startup`, press Enter — an Explorer window
+   opens on your Startup folder.
+2. Right-click `OpenCashDrawer.bat` → **Show more options** → **Create
+   shortcut** (Windows won't create it inside the Startup folder directly,
+   so make it next to the file first).
+3. Move the new shortcut into the Startup folder from step 1.
+4. Sign out and back in to confirm the button appears on its own.
+
+If you want it for every user of the till, use the all-users folder
+instead: `shell:common startup` (needs admin to write there).
+
+Alternative: Task Scheduler, useful if the button comes up before the
+printer is ready and errors — you can add a delay.
+
+1. Open **Task Scheduler** → **Create Basic Task**.
+2. Name it "Cash drawer button", trigger **When I log on**.
+3. Action **Start a program**, program:
+   `C:\path\to\OpenCashDrawer.bat`.
+4. After creating it, open the task's **Properties → Triggers → Edit** and
+   tick **Delay task for: 30 seconds** if you need the printer/USB stack up
+   first. On the **Conditions** tab, untick "Start the task only if the
+   computer is on AC power" for laptops.
 
 ## Troubleshooting
 
