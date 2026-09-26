@@ -6,9 +6,11 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 480px; margin: 3rem auto; }
     button { font-size: 1.2rem; padding: 0.8rem 1.6rem; cursor: pointer; }
+    textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 0.85rem; }
     #status { margin-top: 1rem; font-weight: bold; }
     .ok { color: #0a8a50; }
     .fail { color: #c02828; }
+    h2 { margin-top: 2.5rem; }
   </style>
 </head>
 <body>
@@ -20,6 +22,23 @@
   <button id="test-open">Open drawer</button>
   <p id="status"></p>
 
+  <h2>Receipt printing test</h2>
+  <p>Edit the text and print it (Printer mode only):</p>
+  <textarea id="receipt-text" rows="10">
+        MY SHOP
+   123 High Street
+
+Widget            2 x  4.50    9.00
+Gadget            1 x 12.99   12.99
+------------------------------------
+TOTAL                         21.99
+CASH                          25.00
+CHANGE                         3.01
+
+  Thank you, come again!</textarea>
+  <br>
+  <button id="test-print">Print receipt</button>
+
   <script src="website-trigger.js"></script>
   <script>
     const status = document.getElementById('status');
@@ -27,6 +46,12 @@
       status.textContent = '...';
       const ok = await openCashDrawer();
       status.textContent = ok ? 'Drawer opened' : 'Failed - check the console (F12) and that the app is running';
+      status.className = ok ? 'ok' : 'fail';
+    });
+    document.getElementById('test-print').addEventListener('click', async () => {
+      status.textContent = '...';
+      const ok = await printReceipt(document.getElementById('receipt-text').value);
+      status.textContent = ok ? 'Receipt sent to printer' : 'Failed - check the console (F12) and that the app is running';
       status.className = ok ? 'ok' : 'fail';
     });
   </script>

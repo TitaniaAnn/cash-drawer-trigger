@@ -35,13 +35,18 @@ $BaudRate = 9600
 [byte[]]$ComKickBytes = $KickBytes
 
 # --- Browser / HTTP trigger ---
-# When enabled, the app also listens on http://localhost:<port>/open so a web
-# page's JavaScript can kick the drawer:
-#   fetch('http://localhost:8737/open', { method: 'POST' })
+# When enabled, the app also listens on http://localhost:<port> so a web
+# page's JavaScript can kick the drawer or print a receipt:
+#   fetch('http://localhost:8737/open',  { method: 'POST' })
+#   fetch('http://localhost:8737/print', { method: 'POST', body: receiptText })
 # Loopback only - nothing outside this machine can reach it.
 $EnableHttpTrigger = $true
 $HttpPort          = 8737
 $AllowedOrigin     = '*'   # tighten to your POS site, e.g. 'https://pos.example.com'
+
+# --- Receipt printing (/print endpoint, Printer mode only) ---
+$ReceiptWidth  = 42     # characters per line: 42 or 48 on most 80mm printers, 32 on 58mm
+$CutAfterPrint = $true  # partial-cut after each receipt ($false if no auto-cutter)
 
 # --- Button appearance ---
 $ButtonText = "OPEN`nDRAWER"
@@ -83,13 +88,18 @@ public static class RawPrinter
 
     public static void Send(string printerName, byte[] data)
     {
+        Send(printerName, data, "Cash Drawer Kick");
+    }
+
+    public static void Send(string printerName, byte[] data, string docName)
+    {
         IntPtr h;
         if (!OpenPrinterW(printerName, out h, IntPtr.Zero))
             throw new Exception("Printer not found: " + printerName +
                 " (Win32 error " + Marshal.GetLastWin32Error() + ")");
         try
         {
-            var di = new DOCINFOW { pDocName = "Cash Drawer Kick", pDataType = "RAW" };
+            var di = new DOCINFOW { pDocName = docName, pDataType = "RAW" };
             if (!StartDocPrinterW(h, 1, ref di))
                 throw new Exception("StartDocPrinter failed (error " + Marshal.GetLastWin32Error() + ")");
             try
@@ -122,6 +132,48 @@ function Open-Drawer {
             $port.Dispose()
         }
     }
+}
+
+# Formats plain text for the receipt printer and prints it as a RAW ESC/POS
+# job: word-wraps lines longer than $ReceiptWidth, converts to code page 437,
+# feeds clear of the tear bar and (optionally) cuts. Lines already within
+# $ReceiptWidth are passed through untouched, so space-aligned columns from
+# the sender survive.
+function Print-Receipt {
+    param([string]$Text)
+    if ($Mode -ne 'Printer') {
+        throw "Receipt printing needs Mode = 'Printer'; COM mode only talks to the drawer."
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in (($Text -replace "`r`n", "`n") -split "`n")) {
+        if ($line.Length -le $ReceiptWidth) {
+            $lines.Add($line)
+            continue
+        }
+        $current = ''
+        foreach ($word in ($line -split ' ')) {
+            while ($word.Length -gt $ReceiptWidth) {   # hard-break oversized words
+                if ($current -ne '') { $lines.Add($current); $current = '' }
+                $lines.Add($word.Substring(0, $ReceiptWidth))
+                $word = $word.Substring($ReceiptWidth)
+            }
+            if ($current -eq '') { $current = $word }
+            elseif (($current.Length + 1 + $word.Length) -le $ReceiptWidth) { $current = "$current $word" }
+            else { $lines.Add($current); $current = $word }
+        }
+        if ($current -ne '') { $lines.Add($current) }
+    }
+
+    $cp437 = [System.Text.Encoding]::GetEncoding(437)   # ESC/POS default code page
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    $bytes.AddRange([byte[]](0x1B, 0x40))               # ESC @ - reset formatting
+    $bytes.AddRange($cp437.GetBytes(($lines -join "`n") + "`n"))
+    $bytes.AddRange([byte[]](0x0A, 0x0A, 0x0A, 0x0A))   # feed past the tear bar
+    if ($CutAfterPrint) {
+        $bytes.AddRange([byte[]](0x1D, 0x56, 0x42, 0x00))   # GS V B 0 - partial cut
+    }
+    [RawPrinter]::Send($PrinterName, $bytes.ToArray(), 'Receipt')
 }
 
 # ============================ UI =============================================
@@ -265,7 +317,12 @@ if ($EnableHttpTrigger) {
                     $writer = New-Object System.IO.StreamWriter($stream)
 
                     $requestLine = $reader.ReadLine()
-                    while (-not [string]::IsNullOrEmpty($reader.ReadLine())) { }   # drain headers
+                    $contentLength = 0
+                    while ($true) {   # drain headers, noting Content-Length
+                        $h = $reader.ReadLine()
+                        if ([string]::IsNullOrEmpty($h)) { break }
+                        if ($h -match '^Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1] }
+                    }
 
                     $parts  = "$requestLine" -split ' '
                     $method = $parts[0]
@@ -284,8 +341,45 @@ if ($EnableHttpTrigger) {
                             Send-HttpResponse $writer '500 Internal Server Error' "{`"ok`":false,`"error`":`"$safe`"}"
                         }
                     }
+                    elseif ($path -eq '/print') {
+                        # Body is the receipt as plain text; Content-Length is in
+                        # bytes, so count consumed bytes while reading chars.
+                        $body = ''
+                        if ($contentLength -gt 0) {
+                            $sb  = New-Object System.Text.StringBuilder
+                            $buf = New-Object char[] 4096
+                            $remaining = $contentLength
+                            while ($remaining -gt 0) {
+                                $n = $reader.Read($buf, 0, [Math]::Min($buf.Length, $remaining))
+                                if ($n -le 0) { break }
+                                [void]$sb.Append($buf, 0, $n)
+                                $remaining -= [System.Text.Encoding]::UTF8.GetByteCount($buf, 0, $n)
+                            }
+                            $body = $sb.ToString()
+                        }
+
+                        if ([string]::IsNullOrWhiteSpace($body)) {
+                            Send-HttpResponse $writer '400 Bad Request' '{"ok":false,"error":"empty body - POST the receipt text as plain text"}'
+                        }
+                        else {
+                            try {
+                                Print-Receipt $body
+                                $button.BackColor = [System.Drawing.Color]::FromArgb(0, 180, 100)
+                                $button.Text = 'PRINT'
+                                $flashTimer.Stop(); $flashTimer.Start()
+                                Send-HttpResponse $writer '200 OK' '{"ok":true}'
+                            }
+                            catch {
+                                $safe = $_.Exception.Message -replace '[\\"]', "'" -replace '[\r\n\t]', ' '
+                                $button.BackColor = [System.Drawing.Color]::FromArgb(180, 40, 40)
+                                $button.Text = 'ERROR'
+                                $flashTimer.Stop(); $flashTimer.Start()
+                                Send-HttpResponse $writer '500 Internal Server Error' "{`"ok`":false,`"error`":`"$safe`"}"
+                            }
+                        }
+                    }
                     else {
-                        Send-HttpResponse $writer '404 Not Found' '{"ok":false,"error":"unknown path, use /open"}'
+                        Send-HttpResponse $writer '404 Not Found' '{"ok":false,"error":"unknown path, use /open or /print"}'
                     }
                 }
                 catch { }   # a hung or malformed client shouldn't kill the app
